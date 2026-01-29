@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch postgres (gdb)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/work/.pg/install/bin/postgres",
+      "args": ["-D", "/work/.pg/data", "-p", "5432"],
+      "cwd": "/work/.pg/postgres",
+      "stopAtEntry": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "environment": [
+        { "name": "PATH", "value": "/work/.pg/install/bin:${env:PATH}" }
+      ]
+    }
+  ]
+}
+
