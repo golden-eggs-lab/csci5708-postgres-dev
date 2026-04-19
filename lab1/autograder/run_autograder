@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Gradescope Autograder — run_autograder
+# CSCI 5708 Lab: 2nd-LRU Buffer Replacement
+#
+# This script runs for EVERY student submission. It:
+#   1. Locates the student's freelist.c
+#   2. Copies it into the PG source tree
+#   3. Does an incremental compile
+#   4. Initializes a fresh database
+#   5. Starts the server and runs the test SQL
+#   6. Captures stdout and invokes the grading script
+# =============================================================================
+set -uo pipefail
+
+PG_SRC=/autograder/source/pg_src
+PG_INSTALL=/autograder/source/pg_install
+PG_DATA=/tmp/pg_data
+RESULTS_DIR=/autograder/results
+SUBMISSION_DIR=/autograder/submission
+SRC_DIR=/autograder/source
+
+export PATH="$PG_INSTALL/bin:$PATH"
+
+# Ensure results directory exists
+mkdir -p "$RESULTS_DIR"
+
+# ---------------------------------------------------------------------------
+# Helper: write a failure result and exit
+# ---------------------------------------------------------------------------
+fail_with_message() {
+    local msg="$1"
+    local score="${2:-0}"
+    python3 "$SRC_DIR/grade.py" --fail "$msg" --score "$score"
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# 1. Locate student's freelist.c
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Locating student submission ==="
+
+STUDENT_FREELIST=""
+
+# Check common submission structures
+if [ -f "$SUBMISSION_DIR/freelist.c" ]; then
+    STUDENT_FREELIST="$SUBMISSION_DIR/freelist.c"
+elif [ -f "$SUBMISSION_DIR/changes/freelist.c" ]; then
+    STUDENT_FREELIST="$SUBMISSION_DIR/changes/freelist.c"
+else
+    # Search recursively
+    FOUND=$(find "$SUBMISSION_DIR" -name "freelist.c" -type f 2>/dev/null | head -1)
+    if [ -n "$FOUND" ]; then
+        STUDENT_FREELIST="$FOUND"
+    fi
+fi
+
+if [ -z "$STUDENT_FREELIST" ]; then
+    fail_with_message "Could not find freelist.c in your submission. Make sure you submit a file named exactly freelist.c."
+fi
+
+echo "Found student freelist.c at: $STUDENT_FREELIST"
+
+# ---------------------------------------------------------------------------
+# 2. Copy student's freelist.c and do incremental compile
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Compiling with student's freelist.c ==="
+
+cp "$STUDENT_FREELIST" "$PG_SRC/src/backend/storage/buffer/freelist.c"
+
+# Also re-copy the provided files (in case student accidentally included them)
+cp "$SRC_DIR/buf_internals.h" "$PG_SRC/src/include/storage/buf_internals.h"
+cp "$SRC_DIR/buf_init.c"      "$PG_SRC/src/backend/storage/buffer/buf_init.c"
+cp "$SRC_DIR/bufmgr.c"        "$PG_SRC/src/backend/storage/buffer/bufmgr.c"
+
+cd "$PG_SRC"
+
+# Touch the freelist.c to force recompile of just that file
+touch "$PG_SRC/src/backend/storage/buffer/freelist.c"
+
+COMPILE_OUTPUT=$(make -j"$(nproc)" 2>&1) || {
+    fail_with_message "**Compilation failed.**\n\nCompiler output:\n\`\`\`\n${COMPILE_OUTPUT}\n\`\`\`\n\nPlease check your code for syntax errors."
+}
+
+INSTALL_OUTPUT=$(make install 2>&1) || {
+    fail_with_message "**Installation failed.**\n\nOutput:\n\`\`\`\n${INSTALL_OUTPUT}\n\`\`\`"
+}
+
+echo "Compilation successful."
+
+# ---------------------------------------------------------------------------
+# 3. Initialize a fresh database cluster
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Initializing database ==="
+
+# Clean up any previous data
+rm -rf "$PG_DATA"
+
+# initdb as the current user (non-root)
+# Gradescope runs as root, but PG refuses to run as root, so we use
+# a dedicated user
+if [ "$(id -u)" = "0" ]; then
+    # Create a non-root user for PostgreSQL
+    useradd -m -s /bin/bash pguser 2>/dev/null || true
+    chown -R pguser:pguser "$PG_INSTALL" 2>/dev/null || true
+
+    su - pguser -c "export PATH=$PG_INSTALL/bin:\$PATH && initdb -D $PG_DATA" > /dev/null 2>&1 || {
+        fail_with_message "Failed to initialize the database cluster (initdb). This is likely an autograder issue, not your fault."
+    }
+
+    # Apply the provided postgresql.conf
+    cp "$SRC_DIR/postgresql.conf" "$PG_DATA/postgresql.conf"
+    # Comment out locale settings that may not exist on the Gradescope image
+    sed -i 's/^lc_messages/#lc_messages/' "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_monetary/#lc_monetary/' "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_numeric/#lc_numeric/'   "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_time/#lc_time/'         "$PG_DATA/postgresql.conf"
+    chown pguser:pguser "$PG_DATA/postgresql.conf"
+
+    PG_USER="pguser"
+else
+    initdb -D "$PG_DATA" > /dev/null 2>&1 || {
+        fail_with_message "Failed to initialize the database cluster."
+    }
+    cp "$SRC_DIR/postgresql.conf" "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_messages/#lc_messages/' "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_monetary/#lc_monetary/' "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_numeric/#lc_numeric/'   "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_time/#lc_time/'         "$PG_DATA/postgresql.conf"
+    PG_USER="$(whoami)"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Start the server and capture stdout
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Starting PostgreSQL server ==="
+
+SERVER_STDOUT=/tmp/pg_server_stdout.log
+SERVER_STDERR=/tmp/pg_server_stderr.log
+
+# Clean old logs
+rm -f "$SERVER_STDOUT" "$SERVER_STDERR"
+
+# Start server - redirect stdout (where printf goes) to a file
+if [ "$(id -u)" = "0" ]; then
+    chown -R pguser:pguser "$PG_DATA"
+    # Pre-create log files owned by pguser so redirection works
+    touch "$SERVER_STDOUT" "$SERVER_STDERR"
+    chown pguser:pguser "$SERVER_STDOUT" "$SERVER_STDERR"
+    su - pguser -c "export PATH=$PG_INSTALL/bin:\$PATH && postgres -D $PG_DATA > $SERVER_STDOUT 2>$SERVER_STDERR" &
+else
+    postgres -D "$PG_DATA" > "$SERVER_STDOUT" 2>"$SERVER_STDERR" &
+fi
+
+# Wait for the server to be ready (up to 30 seconds)
+echo "Waiting for server to start..."
+for i in $(seq 1 30); do
+    if [ "$(id -u)" = "0" ]; then
+        su - pguser -c "export PATH=$PG_INSTALL/bin:\$PATH && pg_isready -q" 2>/dev/null && break
+    else
+        pg_isready -q 2>/dev/null && break
+    fi
+    sleep 1
+done
+
+# Check if server is actually ready
+if [ "$(id -u)" = "0" ]; then
+    su - pguser -c "export PATH=$PG_INSTALL/bin:\$PATH && pg_isready -q" 2>/dev/null || {
+        STDERR_CONTENT=$(cat "$SERVER_STDERR" 2>/dev/null | tail -30)
+        fail_with_message "**Server failed to start.**\n\nServer log (last 30 lines):\n\`\`\`\n${STDERR_CONTENT}\n\`\`\`\n\nThis may indicate a crash in your code. Check for missing global variable declarations or other runtime errors."
+    }
+else
+    pg_isready -q 2>/dev/null || {
+        STDERR_CONTENT=$(cat "$SERVER_STDERR" 2>/dev/null | tail -30)
+        fail_with_message "**Server failed to start.**\n\nServer log:\n\`\`\`\n${STDERR_CONTENT}\n\`\`\`"
+    }
+fi
+
+echo "Server is running."
+
+# ---------------------------------------------------------------------------
+# 5. Run the test SQL
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Running test SQL ==="
+
+# Copy test data
+cp "$SRC_DIR/values10k.dat" /tmp/values10k.dat
+
+# Create a modified buffer_add.sql pointing to /tmp
+cat > /tmp/buffer_add.sql <<'EOSQL'
+drop table if exists test_table;
+CREATE TABLE test_table (id serial, PRIMARY KEY (id), value1 int not null, value2 int not null, value3 real, value4 real);
+create index value1_index on test_table(value1);
+set client_encoding = LATIN1;
+COPY test_table(value1,value2,value3,value4) from '/tmp/values10k.dat' DELIMITERS ';';
+EOSQL
+
+if [ "$(id -u)" = "0" ]; then
+    chmod 644 /tmp/values10k.dat
+    SQL_OUTPUT=$(su - pguser -c "export PATH=$PG_INSTALL/bin:\$PATH && psql -d postgres -f /tmp/buffer_add.sql" 2>&1) || {
+        STDERR_CONTENT=$(cat "$SERVER_STDERR" 2>/dev/null | tail -30)
+        fail_with_message "**Test SQL failed to execute.**\n\npsql output:\n\`\`\`\n${SQL_OUTPUT}\n\`\`\`\n\nServer log:\n\`\`\`\n${STDERR_CONTENT}\n\`\`\`\n\nThis may indicate a runtime error in your 2nd-LRU implementation (e.g., elog(ERROR))."
+    }
+else
+    SQL_OUTPUT=$(psql -d postgres -f /tmp/buffer_add.sql 2>&1) || {
+        STDERR_CONTENT=$(cat "$SERVER_STDERR" 2>/dev/null | tail -30)
+        fail_with_message "**Test SQL failed.**\n\nOutput:\n\`\`\`\n${SQL_OUTPUT}\n\`\`\`\n\nServer log:\n\`\`\`\n${STDERR_CONTENT}\n\`\`\`"
+    }
+fi
+
+echo "Test SQL output: $SQL_OUTPUT"
+
+# Give the server a moment to flush stdout
+sleep 2
+
+# ---------------------------------------------------------------------------
+# 6. Stop the server
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Stopping server ==="
+
+if [ "$(id -u)" = "0" ]; then
+    su - pguser -c "export PATH=$PG_INSTALL/bin:\$PATH && pg_ctl -D $PG_DATA stop -m fast" > /dev/null 2>&1 || true
+else
+    pg_ctl -D "$PG_DATA" stop -m fast > /dev/null 2>&1 || true
+fi
+
+# Wait a moment for server to fully stop
+sleep 2
+
+# ---------------------------------------------------------------------------
+# 7. Run the grading script
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Grading output ==="
+
+python3 "$SRC_DIR/grade.py" \
+    --stdout-file "$SERVER_STDOUT" \
+    --sql-output "$SQL_OUTPUT"
+
+echo "=== [run_autograder] Done ==="

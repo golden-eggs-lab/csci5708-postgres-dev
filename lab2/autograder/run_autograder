@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Gradescope Autograder — run_autograder
+# CSCI 5708 Lab 2: B-tree Instrumentation
+#
+# For every student submission:
+#   1. Locates the student's three .c files
+#   2. Copies them into the PG source tree
+#   3. Incremental compile
+#   4. Fresh database + postgresql.conf with btree_lab.enable_stats = on
+#   5. Runs test workloads, captures psql stderr (where INFO lines appear)
+#   6. Invokes grade.py
+# =============================================================================
+set -uo pipefail
+
+PG_SRC=/autograder/source/pg_src
+PG_INSTALL=/autograder/source/pg_install
+PG_DATA=/tmp/pg_data
+RESULTS_DIR=/autograder/results
+SUBMISSION_DIR=/autograder/submission
+SRC_DIR=/autograder/source
+
+export PATH="$PG_INSTALL/bin:$PATH"
+
+mkdir -p "$RESULTS_DIR"
+
+# ---------------------------------------------------------------------------
+# Helper: write a failure result and exit
+# ---------------------------------------------------------------------------
+fail_with_message() {
+    local msg="$1"
+    local score="${2:-0}"
+    python3 "$SRC_DIR/grade.py" --fail "$msg" --score "$score"
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# 1. Locate student files
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Locating student submission ==="
+
+find_file() {
+    local name="$1"
+    local found=""
+    if [ -f "$SUBMISSION_DIR/$name" ]; then
+        found="$SUBMISSION_DIR/$name"
+    else
+        found=$(find "$SUBMISSION_DIR" -name "$name" -type f 2>/dev/null | head -1)
+    fi
+    echo "$found"
+}
+
+STUDENT_NBTSEARCH=$(find_file "nbtsearch.c")
+STUDENT_NBTINSERT=$(find_file "nbtinsert.c")
+STUDENT_NBTREE=$(find_file "nbtree.c")
+
+MISSING=""
+[ -z "$STUDENT_NBTSEARCH" ] && MISSING="$MISSING nbtsearch.c"
+[ -z "$STUDENT_NBTINSERT" ] && MISSING="$MISSING nbtinsert.c"
+[ -z "$STUDENT_NBTREE" ]    && MISSING="$MISSING nbtree.c"
+
+if [ -n "$MISSING" ]; then
+    fail_with_message "Could not find the following file(s) in your submission:$MISSING
+
+Please submit exactly three files: **nbtsearch.c**, **nbtinsert.c**, and **nbtree.c**."
+fi
+
+echo "Found: $STUDENT_NBTSEARCH $STUDENT_NBTINSERT $STUDENT_NBTREE"
+
+# ---------------------------------------------------------------------------
+# 2. Copy student files and compile
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Compiling ==="
+
+cp "$STUDENT_NBTSEARCH" "$PG_SRC/src/backend/access/nbtree/nbtsearch.c"
+cp "$STUDENT_NBTINSERT" "$PG_SRC/src/backend/access/nbtree/nbtinsert.c"
+cp "$STUDENT_NBTREE"    "$PG_SRC/src/backend/access/nbtree/nbtree.c"
+
+cd "$PG_SRC"
+touch "$PG_SRC/src/backend/access/nbtree/nbtsearch.c" \
+      "$PG_SRC/src/backend/access/nbtree/nbtinsert.c" \
+      "$PG_SRC/src/backend/access/nbtree/nbtree.c"
+
+COMPILE_OUTPUT=$(make -j"$(nproc)" 2>&1) || {
+    fail_with_message "**Compilation failed.**
+
+Compiler output:
+\`\`\`
+${COMPILE_OUTPUT}
+\`\`\`
+
+Check your code for syntax errors."
+}
+
+INSTALL_OUTPUT=$(make install 2>&1) || {
+    fail_with_message "**Installation failed.**
+
+Output:
+\`\`\`
+${INSTALL_OUTPUT}
+\`\`\`"
+}
+
+echo "Compilation successful."
+
+# ---------------------------------------------------------------------------
+# 3. Initialize database
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Initializing database ==="
+rm -rf "$PG_DATA"
+
+if [ "$(id -u)" = "0" ]; then
+    useradd -m -s /bin/bash pguser 2>/dev/null || true
+    chown -R pguser:pguser "$PG_INSTALL" 2>/dev/null || true
+    su - pguser -c "export PATH=$PG_INSTALL/bin:\$PATH && initdb -D $PG_DATA" > /dev/null 2>&1 || {
+        fail_with_message "initdb failed. This is likely an autograder issue."
+    }
+    cp "$SRC_DIR/postgresql.conf" "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_messages/#lc_messages/' "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_monetary/#lc_monetary/' "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_numeric/#lc_numeric/'   "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_time/#lc_time/'         "$PG_DATA/postgresql.conf"
+    chown pguser:pguser "$PG_DATA/postgresql.conf"
+    PG_USER="pguser"
+else
+    initdb -D "$PG_DATA" > /dev/null 2>&1 || {
+        fail_with_message "initdb failed."
+    }
+    cp "$SRC_DIR/postgresql.conf" "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_messages/#lc_messages/' "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_monetary/#lc_monetary/' "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_numeric/#lc_numeric/'   "$PG_DATA/postgresql.conf"
+    sed -i 's/^lc_time/#lc_time/'         "$PG_DATA/postgresql.conf"
+    PG_USER="$(whoami)"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Start server
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Starting server ==="
+
+SERVER_LOG=/tmp/pg_server.log
+rm -f "$SERVER_LOG"
+
+run_pg() {
+    if [ "$(id -u)" = "0" ]; then
+        chown -R pguser:pguser "$PG_DATA"
+        su - pguser -c "export PATH=$PG_INSTALL/bin:\$PATH && $*"
+    else
+        eval "$@"
+    fi
+}
+
+run_pg "pg_ctl -D $PG_DATA -l $SERVER_LOG start -w -t 30" || {
+    LOG_TAIL=$(tail -30 "$SERVER_LOG" 2>/dev/null)
+    fail_with_message "**Server failed to start.**
+
+Server log:
+\`\`\`
+${LOG_TAIL}
+\`\`\`"
+}
+
+echo "Server is running."
+
+# ---------------------------------------------------------------------------
+# 5. Run test workloads and capture stderr
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Running tests ==="
+
+STATS_DIR=/tmp/lab2_stats
+rm -rf "$STATS_DIR"
+mkdir -p "$STATS_DIR"
+
+cp "$SRC_DIR/values10k.dat" /tmp/values10k.dat
+chmod 644 /tmp/values10k.dat
+
+run_psql() {
+    local label="$1"
+    local sql="$2"
+    local stderr_file="$STATS_DIR/${label}.txt"
+    local stdout_file="$STATS_DIR/${label}_stdout.txt"
+    if [ "$(id -u)" = "0" ]; then
+        su - pguser -c "export PATH=$PG_INSTALL/bin:\$PATH && psql -d postgres -c \"$sql\"" > "$stdout_file" 2> "$stderr_file"
+    else
+        psql -d postgres -c "$sql" > "$stdout_file" 2> "$stderr_file"
+    fi
+    local rc=$?
+    echo "  Test $label: exit=$rc, stderr_lines=$(wc -l < "$stderr_file")"
+    return $rc
+}
+
+# --- Test A: Setup (table + index + bulk insert, stats OFF initially) ---
+run_psql "setup" "
+DROP TABLE IF EXISTS t_lab2;
+CREATE TABLE t_lab2(k int);
+CREATE INDEX idx_lab2 ON t_lab2(k);
+" || true
+
+# --- Test B: Insert workload with stats ON ---
+run_psql "insert_10k" "
+SET btree_lab.enable_stats = on;
+COPY t_lab2(k) FROM '/tmp/values10k.dat';
+" || {
+    # Try alternate approach: generate_series
+    run_psql "insert_10k" "
+SET btree_lab.enable_stats = on;
+INSERT INTO t_lab2 SELECT generate_series(1,10000);
+" || true
+}
+
+# --- Test C: Point lookup ---
+run_psql "point_lookup" "
+SET btree_lab.enable_stats = on;
+SELECT * FROM t_lab2 WHERE k = 5000;
+" || true
+
+# --- Test D: Range scan ---
+run_psql "range_scan" "
+SET btree_lab.enable_stats = on;
+SELECT * FROM t_lab2 WHERE k BETWEEN 1000 AND 2000;
+" || true
+
+# --- Test E: Small insert (split detection) ---
+run_psql "small_setup" "
+DROP TABLE IF EXISTS t_small;
+CREATE TABLE t_small(k int);
+CREATE INDEX idx_small ON t_small(k);
+" || true
+
+run_psql "insert_small" "
+SET btree_lab.enable_stats = on;
+INSERT INTO t_small SELECT generate_series(1,500);
+" || true
+
+# ---------------------------------------------------------------------------
+# 6. Stop server
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Stopping server ==="
+run_pg "pg_ctl -D $PG_DATA stop -m fast" > /dev/null 2>&1 || true
+sleep 1
+
+# ---------------------------------------------------------------------------
+# 7. Grade
+# ---------------------------------------------------------------------------
+echo "=== [run_autograder] Grading ==="
+
+python3 "$SRC_DIR/grade.py" --stats-dir "$STATS_DIR"
+
+echo "=== [run_autograder] Done ==="
